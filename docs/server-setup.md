@@ -218,6 +218,7 @@ sudo ufw status verbose
 | `02-keys-configured` | 2026-10-22 02:12 | вход `ssh devops` по ключу через `~/.ssh/config` |
 | `03-ssh-hardened` | 2026-10-22 14:36 | SSH усилен (раздел 5), порт 2222, проброс 2222 → 2222 |
 | `04-nginx-https` | 2026-10-22 20:06 | Nginx, ресурс `devops.local` по HTTPS, перенаправление HTTP → HTTPS (раздел 8) |
+| `05-docker-compose` | 2026-10-22 21:02 | Docker Engine, проект `~/app`: приложение + PostgreSQL, том `app_db_data` (раздел 9) |
 
 Снимки создаются на выключенной ВМ (`sudo poweroff`).
 
@@ -316,3 +317,79 @@ curl --cacert ~/devops.crt -I https://devops.local     # 200 OK без -k
 
 Проверка: раздел `[4] Веб-сервер` в `scripts/audit.sh`; порог срока действия
 сертификата задаётся переменной `CERT_MIN_DAYS` (по умолчанию 30 дней).
+
+## 9. Контейнеризация
+
+| Параметр | Значение |
+|---|---|
+| Docker Engine | 29.9.2 из официального репозитория `download.docker.com` (пакет `docker.io` дистрибутива не используется) |
+| Пакеты | `docker-ce`, `docker-ce-cli`, `containerd.io` 2.4.2, `docker-buildx-plugin`, `docker-compose-plugin` (Compose v5.6.1) |
+| Группа `docker` | `devops` (у неё есть `sudo`; участник группы фактически получает права root) |
+| Проект | `/home/devops/app` (владелец `devops`), доставляется из каталога `app/` репозитория |
+| Файл `.env` | `/home/devops/app/.env`, `devops:devops`, 600; создаётся только на сервере, в репозитории — шаблон `.env.example` |
+| Сервисы | `app` — образ `devops-app:1.0` (Flask + gunicorn, пользователь `app`, uid 999); `db` — `postgres:16-alpine` с проверкой `pg_isready` |
+| Публикуемые порты | `127.0.0.1:5000 → app:5000`; порт 5432 СУБД не публикуется |
+| Сеть | `app_backend` (bridge); приложение обращается к СУБД по имени `db` |
+| Именованный том | `app_db_data` → `/var/lib/postgresql/data` |
+| Обратный прокси | Nginx, `location /app/` в HTTPS-блоке `/etc/nginx/sites-available/devops-site` (раздел 8) |
+
+Установка Docker Engine (по инструкции docs.docker.com/engine/install/ubuntu):
+
+```bash
+sudo apt-get update && sudo apt-get install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker devops      # затем новая SSH-сессия
+docker run --rm hello-world
+```
+
+Доставка проекта с хоста (WSL) и файл `.env` на сервере:
+
+```bash
+# [Хост] .env исключается: иначе --delete удалит его на сервере
+rsync -avz --delete --exclude=.env app/ devops:app/
+
+# [VM]
+cd ~/app
+cp .env.example .env
+chmod 600 .env
+sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 16)/" .env
+docker compose up -d --build
+docker compose ps                   # db — (healthy)
+curl -s http://127.0.0.1:5000/      # Hello from Docker, Иус! Visits: N
+```
+
+Порт приложения публикуется только на `127.0.0.1`: опубликованный на `0.0.0.0` порт Docker
+открывает собственными правилами iptables (цепочка `DOCKER` таблицы `nat`) в обход политики UFW
+из раздела 6. `docker compose down` сохраняет том `app_db_data`, `docker compose down -v` удаляет
+базу данных без возможности восстановления.
+
+Расположение для приложения в HTTPS-блоке Nginx (копия конфигурации до изменения —
+`/etc/nginx/sites-available/devops-site.bak-pr6`):
+
+```nginx
+    location /app/ {
+        proxy_pass http://127.0.0.1:5000/;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+```
+
+Завершающий `/` в `proxy_pass` заменяет префикс `/app/` на `/`. Проверка с хоста:
+
+```bash
+curl --cacert ~/devops.crt https://devops.local/app/          # Hello from Docker, ...
+curl --cacert ~/devops.crt https://devops.local/app/health    # ok
+curl --cacert ~/devops.crt -I https://devops.local/           # статический ресурс, 200 OK
+```
+
+Если контейнер приложения не принимает соединения, Nginx отвечает `502 Bad Gateway`, а в журнале
+`devops-site.error.log` — `connect() failed (111: Connection refused) while connecting to upstream`.
+
+Проверка: раздел `[5] Контейнеризация` в `scripts/audit.sh`.
