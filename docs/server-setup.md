@@ -217,5 +217,102 @@ sudo ufw status verbose
 | `01-clean-install` | 2026-10-22 01:59 | ОС установлена и обновлена (`apt update && apt upgrade`), корневой том расширен, создан `devops` с ключом; SSH на порту 22, проброс 2222 → 22 |
 | `02-keys-configured` | 2026-10-22 02:12 | вход `ssh devops` по ключу через `~/.ssh/config` |
 | `03-ssh-hardened` | 2026-10-22 14:36 | SSH усилен (раздел 5), порт 2222, проброс 2222 → 2222 |
+| `04-nginx-https` | 2026-10-22 20:06 | Nginx, ресурс `devops.local` по HTTPS, перенаправление HTTP → HTTPS (раздел 8) |
 
 Снимки создаются на выключенной ВМ (`sudo poweroff`).
+
+## 8. Веб-сервер
+
+| Параметр | Значение |
+|---|---|
+| Пакет | `nginx` из репозитория Ubuntu (`sudo apt install -y nginx`), версия 1.24.0 |
+| Процессы | главный — `root`, рабочие — `www-data` |
+| Конфигурация ресурса | `/etc/nginx/sites-available/devops-site`, ссылка в `/etc/nginx/sites-enabled/` |
+| Стандартный ресурс | отключён: ссылка `/etc/nginx/sites-enabled/default` удалена, файл в `sites-available` сохранён |
+| Каталог ресурса | `/var/www/devops-site`, владелец `devops:devops`, каталоги 755, файлы 644 |
+| Журналы | `/var/log/nginx/devops-site.access.log`, `/var/log/nginx/devops-site.error.log` |
+| Сертификат | `/etc/ssl/certs/devops.crt`, `root:root`, 644; самоподписанный, CN и SAN `DNS:devops.local`, RSA 2048, срок 365 дней (до 2027-10-22) |
+| Закрытый ключ | `/etc/ssl/private/devops.key`, `root:root`, 600 (каталог `/etc/ssl/private` — 700) |
+| Протоколы | TLSv1.2, TLSv1.3; HSTS не используется (самоподписанный сертификат) |
+| Порты | 80 — только перенаправление 301 на HTTPS; 443 — ресурс. Правила UFW из раздела 6 |
+
+Установка и каталог ресурса:
+
+```bash
+sudo apt update && sudo apt install -y nginx
+sudo mkdir -p /var/www/devops-site
+sudo chown -R devops:devops /var/www/devops-site
+```
+
+Сертификат и ключ (запрос без интерактивного ввода, имя ресурса — в поле SAN):
+
+```bash
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+    -keyout /etc/ssl/private/devops.key \
+    -out /etc/ssl/certs/devops.crt \
+    -subj "/CN=devops.local" \
+    -addext "subjectAltName=DNS:devops.local"
+```
+
+`openssl req` создаёт ключ с правами 600 и владельцем `root`; рабочие процессы `www-data`
+ключ прочитать не могут — его загружает главный процесс при запуске.
+
+Содержимое `/etc/nginx/sites-available/devops-site`:
+
+```nginx
+# Блок 1: перенаправление HTTP -> HTTPS
+server {
+    listen 80;
+    listen [::]:80;
+    server_name devops.local;
+
+    return 301 https://$host$request_uri;
+}
+
+# Блок 2: ресурс по HTTPS
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name devops.local;
+
+    ssl_certificate     /etc/ssl/certs/devops.crt;
+    ssl_certificate_key /etc/ssl/private/devops.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    root /var/www/devops-site;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    error_page 404 /404.html;
+
+    access_log /var/log/nginx/devops-site.access.log;
+    error_log /var/log/nginx/devops-site.error.log;
+}
+```
+
+Активация (каждое изменение — только через `nginx -t && reload`, не `restart`):
+
+```bash
+sudo ln -s /etc/nginx/sites-available/devops-site /etc/nginx/sites-enabled/
+sudo rm /etc/nginx/sites-enabled/default
+sudo nginx -t && sudo systemctl reload nginx
+sudo ss -tlnp | grep nginx       # 0.0.0.0:80, 0.0.0.0:443, [::]:80, [::]:443
+```
+
+Доверие к сертификату на хосте (копия по SSH — доверенный канал из раздела 4):
+
+```bash
+scp devops:/etc/ssl/certs/devops.crt ~/devops.crt
+curl --cacert ~/devops.crt -I https://devops.local     # 200 OK без -k
+```
+
+Содержимое доставляется из каталога `site/` репозитория сценарием `scripts/deploy.sh`
+(WSL 1 на хосте: `rsync -avz --delete --chmod=D755,F644`, одно SSH-соединение,
+проверка `curl -f --cacert`). Без `--chmod` на сервер переносятся права рабочей копии
+(в WSL на `/mnt/c` — 777), что позволяет `www-data` изменять файлы.
+
+Проверка: раздел `[4] Веб-сервер` в `scripts/audit.sh`; порог срока действия
+сертификата задаётся переменной `CERT_MIN_DAYS` (по умолчанию 30 дней).
